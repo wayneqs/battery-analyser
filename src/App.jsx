@@ -14,6 +14,7 @@ const OVERNIGHT_START_MINUTES = 1410;
 const OVERNIGHT_END_MINUTES = 330;
 const OVERNIGHT_SLOT_COUNT =
 	((24 * 60 - OVERNIGHT_START_MINUTES) + OVERNIGHT_END_MINUTES) / 30;
+const OFF_PEAK_EV_THRESHOLD_KWH = 18;
 const PEAK_START_MINUTES = 330;
 const PEAK_END_MINUTES = 1410;
 const PEAK_SLOT_COUNT = (PEAK_END_MINUTES - PEAK_START_MINUTES) / 30;
@@ -62,7 +63,7 @@ const shiftDateString = (dateStr, dayOffset) => {
 
 const calculateDemandSummary = (
 	periods,
-	{ usageKey, countKey, expectedSlots, filterHighOutliers = false },
+	{ usageKey, countKey, expectedSlots, maxUsage = null },
 ) => {
 	const completePeriods = periods.filter(
 		(period) => period[countKey] === expectedSlots,
@@ -85,18 +86,9 @@ const calculateDemandSummary = (
 	let sampledPeriods = completePeriods;
 	let excludedPeriods = 0;
 
-	if (filterHighOutliers) {
-		const sortedUsage = completePeriods
-			.map((period) => period[usageKey])
-			.sort((a, b) => a - b);
-		const median = percentile(sortedUsage, 0.5);
-		const q1 = percentile(sortedUsage, 0.25);
-		const q3 = percentile(sortedUsage, 0.75);
-		const iqr = q3 - q1;
-		const upperFence = q3 + iqr * 1.5;
-		const outlierThreshold = Math.max(upperFence, median * 1.75);
+	if (maxUsage !== null) {
 		const filteredPeriods = completePeriods.filter(
-			(period) => period[usageKey] <= outlierThreshold,
+			(period) => period[usageKey] <= maxUsage,
 		);
 		sampledPeriods = filteredPeriods.length ? filteredPeriods : completePeriods;
 		excludedPeriods = completePeriods.length - sampledPeriods.length;
@@ -303,7 +295,7 @@ export default function App() {
 			usageKey: "overnight",
 			countKey: "overnightCount",
 			expectedSlots: OVERNIGHT_SLOT_COUNT,
-			filterHighOutliers: true,
+			maxUsage: OFF_PEAK_EV_THRESHOLD_KWH,
 		});
 		const peakDemand = calculateDemandSummary(parsedData.dailyArray, {
 			usageKey: "peak",
