@@ -1,6 +1,7 @@
 import {
 	BarChart3,
 	Info,
+	MoonStar,
 	PoundSterling,
 	Timer,
 	TrendingDown,
@@ -8,6 +9,119 @@ import {
 	Zap,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+
+const OVERNIGHT_START_MINUTES = 1410;
+const OVERNIGHT_END_MINUTES = 330;
+const OVERNIGHT_SLOT_COUNT =
+	((24 * 60 - OVERNIGHT_START_MINUTES) + OVERNIGHT_END_MINUTES) / 30;
+const PEAK_START_MINUTES = 330;
+const PEAK_END_MINUTES = 1410;
+const PEAK_SLOT_COUNT = (PEAK_END_MINUTES - PEAK_START_MINUTES) / 30;
+
+const percentile = (sortedValues, fraction) => {
+	if (!sortedValues.length) return 0;
+
+	const index = (sortedValues.length - 1) * fraction;
+	const lower = Math.floor(index);
+	const upper = Math.ceil(index);
+
+	if (lower === upper) return sortedValues[lower];
+
+	const weight = index - lower;
+	return (
+		sortedValues[lower] + (sortedValues[upper] - sortedValues[lower]) * weight
+	);
+};
+
+const calculateMode = (values) => {
+	if (!values.length) return 0;
+
+	const frequency = new Map();
+	let bestValue = values[0];
+	let bestCount = 0;
+
+	values.forEach((value) => {
+		const roundedValue = Math.round(value);
+		const count = (frequency.get(roundedValue) ?? 0) + 1;
+		frequency.set(roundedValue, count);
+
+		if (count > bestCount || (count === bestCount && roundedValue < bestValue)) {
+			bestValue = roundedValue;
+			bestCount = count;
+		}
+	});
+
+	return bestValue;
+};
+
+const shiftDateString = (dateStr, dayOffset) => {
+	const date = new Date(`${dateStr}T00:00:00`);
+	date.setDate(date.getDate() + dayOffset);
+	return date.toISOString().slice(0, 10);
+};
+
+const calculateDemandSummary = (
+	periods,
+	{ usageKey, countKey, expectedSlots, filterHighOutliers = false },
+) => {
+	const completePeriods = periods.filter(
+		(period) => period[countKey] === expectedSlots,
+	);
+
+	if (!completePeriods.length) {
+		return {
+			averageWattsPerHour: 0,
+			averageUsage: 0,
+			medianWattsPerHour: 0,
+			modeWattsPerHour: 0,
+			lowestWattsPerHour: 0,
+			highestWattsPerHour: 0,
+			sampledDays: 0,
+			excludedDays: 0,
+			totalEligibleDays: 0,
+		};
+	}
+
+	let sampledPeriods = completePeriods;
+	let excludedPeriods = 0;
+
+	if (filterHighOutliers) {
+		const sortedUsage = completePeriods
+			.map((period) => period[usageKey])
+			.sort((a, b) => a - b);
+		const median = percentile(sortedUsage, 0.5);
+		const q1 = percentile(sortedUsage, 0.25);
+		const q3 = percentile(sortedUsage, 0.75);
+		const iqr = q3 - q1;
+		const upperFence = q3 + iqr * 1.5;
+		const outlierThreshold = Math.max(upperFence, median * 1.75);
+		const filteredPeriods = completePeriods.filter(
+			(period) => period[usageKey] <= outlierThreshold,
+		);
+		sampledPeriods = filteredPeriods.length ? filteredPeriods : completePeriods;
+		excludedPeriods = completePeriods.length - sampledPeriods.length;
+	}
+
+	const totalUsage = sampledPeriods.reduce((sum, period) => sum + period[usageKey], 0);
+	const averageUsage = totalUsage / sampledPeriods.length;
+	const averageWattsPerHour = (averageUsage / expectedSlots) * 2000;
+	const periodAverageWattsPerHour = sampledPeriods
+		.map((period) => (period[usageKey] / expectedSlots) * 2000)
+		.sort((a, b) => a - b);
+
+	return {
+		averageWattsPerHour,
+		averageUsage,
+		medianWattsPerHour: percentile(periodAverageWattsPerHour, 0.5),
+		modeWattsPerHour: calculateMode(periodAverageWattsPerHour),
+		lowestWattsPerHour: periodAverageWattsPerHour[0],
+		highestWattsPerHour:
+			periodAverageWattsPerHour[periodAverageWattsPerHour.length - 1],
+		sampledDays: sampledPeriods.length,
+		excludedDays: excludedPeriods,
+		totalEligibleDays: completePeriods.length,
+	};
+};
 
 export default function App() {
 	const [parsedData, setParsedData] = useState(null);
@@ -41,6 +155,7 @@ export default function App() {
 	const parseCSVData = (text) => {
 		const lines = text.split("\n");
 		let daily = {};
+		let overnightWindows = {};
 
 		let profiles = {
 			all: { hourly: new Array(48).fill(0), counts: new Array(48).fill(0) },
@@ -84,15 +199,44 @@ export default function App() {
 			const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
 
 			if (!daily[datePart]) {
-				daily[datePart] = { peak: 0, offPeak: 0, isWeekend, date: datePart };
+				daily[datePart] = {
+					peak: 0,
+					peakCount: 0,
+					offPeak: 0,
+					isWeekend,
+					date: datePart,
+				};
 			}
 
-			const isPeak = timeInMins >= 330 && timeInMins < 1410;
+				const isPeak =
+					timeInMins >= PEAK_START_MINUTES && timeInMins < PEAK_END_MINUTES;
+				const isOvernightWindow =
+					timeInMins >= OVERNIGHT_START_MINUTES ||
+					timeInMins < OVERNIGHT_END_MINUTES;
 
-			if (isPeak) {
-				daily[datePart].peak += val;
-			} else {
-				daily[datePart].offPeak += val;
+				if (isPeak) {
+					daily[datePart].peak += val;
+					daily[datePart].peakCount++;
+				} else {
+					daily[datePart].offPeak += val;
+				}
+
+			if (isOvernightWindow) {
+				const overnightKey =
+					timeInMins >= OVERNIGHT_START_MINUTES
+						? datePart
+						: shiftDateString(datePart, -1);
+
+				if (!overnightWindows[overnightKey]) {
+					overnightWindows[overnightKey] = {
+						date: overnightKey,
+						overnight: 0,
+						overnightCount: 0,
+					};
+				}
+
+				overnightWindows[overnightKey].overnight += val;
+				overnightWindows[overnightKey].overnightCount++;
 			}
 
 			const slotIndex = hour * 2 + (min >= 30 ? 1 : 0);
@@ -116,7 +260,10 @@ export default function App() {
 		const dailyArray = Object.values(daily).sort(
 			(a, b) => new Date(a.date) - new Date(b.date),
 		);
-		return { dailyArray, profiles };
+		const overnightArray = Object.values(overnightWindows).sort(
+			(a, b) => new Date(a.date) - new Date(b.date),
+		);
+		return { dailyArray, overnightArray, profiles };
 	};
 
 	useEffect(() => {
@@ -152,6 +299,17 @@ export default function App() {
 		const totalDays = parsedData.dailyArray.length || 1;
 		const avgOverallPeak = totalPeakUsage / totalDays;
 		const idealCapacity = avgOverallPeak * 1.15;
+		const overnightDemand = calculateDemandSummary(parsedData.overnightArray ?? [], {
+			usageKey: "overnight",
+			countKey: "overnightCount",
+			expectedSlots: OVERNIGHT_SLOT_COUNT,
+			filterHighOutliers: true,
+		});
+		const peakDemand = calculateDemandSummary(parsedData.dailyArray, {
+			usageKey: "peak",
+			countKey: "peakCount",
+			expectedSlots: PEAK_SLOT_COUNT,
+		});
 		const userCap = parseFloat(customCapacity);
 		const activeCapacity =
 			!isNaN(userCap) && userCap >= 0 ? userCap : idealCapacity;
@@ -190,6 +348,8 @@ export default function App() {
 			avgOverallPeak,
 			idealCapacity,
 			activeCapacity,
+			overnightDemand,
+			peakDemand,
 			profiles: {
 				all: finalizeProfile(parsedData.profiles.all),
 				weekday: finalizeProfile(parsedData.profiles.weekday),
@@ -226,6 +386,11 @@ export default function App() {
 		const maxVal = Math.max(...result.profiles[profileView]);
 		return maxVal <= 0 ? 1 : maxVal * 1.1;
 	}, [result, profileView]);
+
+	const formatDemand = (value) => {
+		if (value >= 1000) return `${(value / 1000).toFixed(2)} kW/h`;
+		return `${Math.round(value).toLocaleString()} W/h`;
+	};
 
 	return (
 		<div className="min-h-screen bg-slate-50 p-6 font-sans text-slate-800 antialiased">
@@ -271,14 +436,21 @@ export default function App() {
 						<button
 							onClick={() => fileInputRef.current?.click()}
 							disabled={isProcessing}
-							className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-xl font-medium text-sm transition-all shadow-sm active:scale-95"
+							className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-xl font-medium text-sm transition-all shadow-sm active:scale-95 text-center"
 						>
 							<Upload size={18} />
 							{isProcessing
 								? "Processing..."
 								: parsedData
 									? "Upload New File"
-									: "Upload consumption.csv"}
+									: (
+										<span className="leading-tight">
+											<span className="block">Upload consumption.csv</span>
+											<span className="block text-[11px] text-blue-100">
+												(Octopus Export)
+											</span>
+										</span>
+									)}
 						</button>
 					</div>
 				</header>
@@ -414,6 +586,178 @@ export default function App() {
 								</div>
 							</div>
 						</div>
+
+							<div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+								<div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
+									<div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-6">
+										<div>
+											<div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
+												23:30-05:30 Off-Peak Demand
+											</div>
+											<div className="mt-3 flex items-end gap-3">
+												<div className="text-4xl font-black text-slate-900">
+													{result.overnightDemand.totalEligibleDays
+														? formatDemand(
+																result.overnightDemand.averageWattsPerHour,
+															).replace(/ (W\/h|kW\/h)$/, "")
+														: "—"}
+												</div>
+												{result.overnightDemand.totalEligibleDays ? (
+													<div className="pb-1 text-sm font-bold uppercase tracking-wide text-slate-400">
+														{result.overnightDemand.averageWattsPerHour >= 1000
+															? "kW/h average demand"
+															: "W/h average demand"}
+													</div>
+												) : null}
+											</div>
+											<p className="mt-2 max-w-2xl text-sm text-slate-500">
+												Estimated from the quiet overnight window and filtered to
+												ignore unusually high nights that are likely EV charging.
+											</p>
+										</div>
+										<div className="inline-flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-blue-50 text-blue-600">
+											<MoonStar size={28} />
+										</div>
+									</div>
+									<div className="mt-6 grid grid-cols-1 gap-4 border-t border-slate-100 pt-6 sm:grid-cols-3">
+										<div>
+											<div className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+												Avg Off-Peak Usage
+											</div>
+											<div className="mt-2 text-2xl font-bold text-slate-800">
+												{result.overnightDemand.totalEligibleDays
+													? `${result.overnightDemand.averageUsage.toFixed(2)} kWh`
+													: "Not enough data"}
+											</div>
+										</div>
+										<div>
+											<div className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+												Mode
+											</div>
+											<div className="mt-2 text-2xl font-bold text-slate-800">
+												{result.overnightDemand.totalEligibleDays
+													? formatDemand(result.overnightDemand.modeWattsPerHour)
+													: "—"}
+											</div>
+										</div>
+										<div>
+											<div className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+												Median
+											</div>
+											<div className="mt-2 text-2xl font-bold text-slate-800">
+												{result.overnightDemand.totalEligibleDays
+													? formatDemand(result.overnightDemand.medianWattsPerHour)
+													: "—"}
+											</div>
+										</div>
+										<div>
+											<div className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+												Lowest
+											</div>
+											<div className="mt-2 text-2xl font-bold text-slate-800">
+												{result.overnightDemand.totalEligibleDays
+													? formatDemand(result.overnightDemand.lowestWattsPerHour)
+													: "—"}
+											</div>
+										</div>
+										<div>
+											<div className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+												Highest
+											</div>
+											<div className="mt-2 text-2xl font-bold text-slate-800">
+												{result.overnightDemand.totalEligibleDays
+													? formatDemand(result.overnightDemand.highestWattsPerHour)
+													: "—"}
+											</div>
+										</div>
+									</div>
+								</div>
+
+								<div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
+									<div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-6">
+										<div>
+											<div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
+												05:30-23:30 Peak Demand
+											</div>
+											<div className="mt-3 flex items-end gap-3">
+												<div className="text-4xl font-black text-slate-900">
+													{result.peakDemand.totalEligibleDays
+														? formatDemand(
+																result.peakDemand.averageWattsPerHour,
+															).replace(/ (W\/h|kW\/h)$/, "")
+														: "—"}
+												</div>
+												{result.peakDemand.totalEligibleDays ? (
+													<div className="pb-1 text-sm font-bold uppercase tracking-wide text-slate-400">
+														{result.peakDemand.averageWattsPerHour >= 1000
+															? "kW/h average demand"
+															: "W/h average demand"}
+													</div>
+												) : null}
+											</div>
+											<p className="mt-2 max-w-2xl text-sm text-slate-500">
+												Average daytime demand across the full peak period for
+												each complete day in the dataset.
+											</p>
+										</div>
+										<div className="inline-flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-rose-50 text-rose-600">
+											<Zap size={28} />
+										</div>
+									</div>
+									<div className="mt-6 grid grid-cols-1 gap-4 border-t border-slate-100 pt-6 sm:grid-cols-3">
+										<div>
+											<div className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+												Avg Peak Usage
+											</div>
+											<div className="mt-2 text-2xl font-bold text-slate-800">
+												{result.peakDemand.totalEligibleDays
+													? `${result.peakDemand.averageUsage.toFixed(2)} kWh`
+													: "Not enough data"}
+											</div>
+										</div>
+										<div>
+											<div className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+												Mode
+											</div>
+											<div className="mt-2 text-2xl font-bold text-slate-800">
+												{result.peakDemand.totalEligibleDays
+													? formatDemand(result.peakDemand.modeWattsPerHour)
+													: "—"}
+											</div>
+										</div>
+										<div>
+											<div className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+												Median
+											</div>
+											<div className="mt-2 text-2xl font-bold text-slate-800">
+												{result.peakDemand.totalEligibleDays
+													? formatDemand(result.peakDemand.medianWattsPerHour)
+													: "—"}
+											</div>
+										</div>
+										<div>
+											<div className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+												Lowest
+											</div>
+											<div className="mt-2 text-2xl font-bold text-slate-800">
+												{result.peakDemand.totalEligibleDays
+													? formatDemand(result.peakDemand.lowestWattsPerHour)
+													: "—"}
+											</div>
+										</div>
+										<div>
+											<div className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+												Highest
+											</div>
+											<div className="mt-2 text-2xl font-bold text-slate-800">
+												{result.peakDemand.totalEligibleDays
+													? formatDemand(result.peakDemand.highestWattsPerHour)
+													: "—"}
+											</div>
+										</div>
+									</div>
+								</div>
+							</div>
 
 						{/* Timeline */}
 						<div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
